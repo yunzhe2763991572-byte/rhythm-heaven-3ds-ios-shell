@@ -2,7 +2,9 @@
 #import <AVFoundation/AVFoundation.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <QuartzCore/QuartzCore.h>
+#import <GameController/GameController.h>
 #import "Mobile.h"
+#include "ControllerInput.h"
 #include <string.h>
 #include <stdatomic.h>
 
@@ -150,6 +152,8 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
     uint64_t pendingGeneration,totalLogicFrames,seenLogicFrames;
     uint64_t copiedGeneration;
     uint32_t held,latched;
+    GCController *activeController;
+    RHControllerState controllerInput;
     CGPoint touchPoint;
     double lastFrameTime;
     double nextEmulationTime;
@@ -226,6 +230,9 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
     [self.view addSubview:controlStyleButton];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(background) name:UIApplicationWillResignActiveNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(foreground) name:UIApplicationDidBecomeActiveNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(controllersChanged:) name:GCControllerDidConnectNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(controllersChanged:) name:GCControllerDidDisconnectNotification object:nil];
+    [self controllersChanged:nil];
     NSBundle *files=NSBundle.mainBundle;
     for(NSString *relative in @[@"Game/Program.cia",@"Frameworks/Guest.framework/Guest",@"Fonts/NotoSansJP.ttf"]) {
         if(![[NSFileManager defaultManager] fileExistsAtPath:[files.bundlePath stringByAppendingPathComponent:relative]]) {
@@ -262,6 +269,9 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
     CGRect safe=UIEdgeInsetsInsetRect(self.view.bounds,self.view.safeAreaInsets);
     CGFloat w=safe.size.width,h=safe.size.height;
     BOOL landscape=w>h;
+    BOOL controllerConnected=activeController!=nil;
+    for(NSUInteger i=0;i<8;i++) buttons[i].hidden=controllerConnected;
+    controlStyleButton.hidden=controllerConnected;
     pauseButton.hidden=landscape;
     qualityButton.hidden=landscape;
     buttons[10].hidden=YES;buttons[11].hidden=YES;
@@ -386,8 +396,63 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
     }
 }
 - (void)clearInputs {
-    [inputLock lock];held=latched=0;touchDown=touchLatched=NO;[inputLock unlock];
+    [inputLock lock];held=latched=0;touchDown=touchLatched=NO;rh_controller_clear(&controllerInput);[inputLock unlock];
     for(UIButton *button in buttons) button.alpha=1;
+}
+- (void)readController:(GCExtendedGamepad *)pad {
+    if(!pad||activeController.extendedGamepad!=pad)return;
+    RHControllerButtons b={
+        .bottom=pad.buttonA.isPressed,.right=pad.buttonB.isPressed,
+        .left=pad.buttonX.isPressed,.top=pad.buttonY.isPressed,
+        .dpadUp=pad.dpad.up.isPressed,.dpadDown=pad.dpad.down.isPressed,
+        .dpadLeft=pad.dpad.left.isPressed,.dpadRight=pad.dpad.right.isPressed,
+        .stickUp=pad.leftThumbstick.up.isPressed,.stickDown=pad.leftThumbstick.down.isPressed,
+        .stickLeft=pad.leftThumbstick.left.isPressed,.stickRight=pad.leftThumbstick.right.isPressed,
+        .shoulderLeft=pad.leftShoulder.isPressed,.shoulderRight=pad.rightShoulder.isPressed,
+        .menu=pad.buttonMenu.isPressed,.options=pad.buttonOptions.isPressed
+    };
+    BOOL enabled=!paused&&!keyboardActive&&!failed&&UIApplication.sharedApplication.applicationState==UIApplicationStateActive;
+    [inputLock lock];rh_controller_update(&controllerInput,rh_controller_mask(b),enabled);[inputLock unlock];
+}
+- (void)controllersChanged:(NSNotification *)notification {
+    if(!NSThread.isMainThread) {
+        __weak Game *weakSelf=self;
+        dispatch_async(dispatch_get_main_queue(),^{[weakSelf controllersChanged:notification];});return;
+    }
+    GCController *removed=[notification.name isEqualToString:GCControllerDidDisconnectNotification]?notification.object:nil;
+    NSArray<GCController *> *controllers=GCController.controllers;
+    GCController *selected=nil;
+    // Keep the current player when a second controller connects.
+    if(activeController&&activeController!=removed&&[controllers containsObject:activeController]&&activeController.extendedGamepad) selected=activeController;
+    if(!selected)for(GCController *candidate in controllers) {
+        if(candidate!=removed&&candidate.extendedGamepad) {selected=candidate;break;}
+    }
+    if(selected==activeController) { [self readController:selected.extendedGamepad];return; }
+    activeController.extendedGamepad.valueChangedHandler=nil;
+    [inputLock lock];
+    controllerInput=(RHControllerState){0};
+    // Connecting hides the face/direction buttons. Release their touch
+    // source, while keeping the independent lower-screen touch intact.
+    if(selected)held=latched=0;
+    [inputLock unlock];
+    for(UIButton *button in buttons)button.alpha=1;
+    activeController=selected;
+    if(selected) {
+        selected.handlerQueue=dispatch_get_main_queue();
+        __weak Game *weakSelf=self;
+        selected.extendedGamepad.valueChangedHandler=^(GCExtendedGamepad *pad,GCControllerElement *element) {
+            (void)element;[weakSelf readController:pad];
+        };
+        [self readController:selected.extendedGamepad];
+        [inputLock lock];rh_controller_clear(&controllerInput);[inputLock unlock];
+    }
+    [self.view setNeedsLayout];
+    // Do not log controller identifiers or every button press.
+    rh_note(selected?"controller: connected; Nintendo positions; touch action keys hidden":"controller: disconnected; touch controls restored");
+}
+- (void)dealloc {
+    activeController.extendedGamepad.valueChangedHandler=nil;
+    [[NSNotificationCenter defaultCenter] removeObserver:self];
 }
 - (void)updateControlStyleTitle {
     [controlStyleButton setTitle:dualAB?@"按键: A/B":@"按键: 大A" forState:UIControlStateNormal];
@@ -438,7 +503,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
             return;
         }
         [inputLock lock];
-        uint32_t keys=held|latched;latched=0;
+        uint32_t keys=held|latched|rh_controller_take(&controllerInput);latched=0;
         BOOL touched=touchDown||touchLatched;touchLatched=NO;
         uint16_t x=(uint16_t)touchPoint.x,y=(uint16_t)touchPoint.y;
         [inputLock unlock];
@@ -524,6 +589,7 @@ static UIImage *Image(const uint8_t *bytes,size_t count,size_t width) {
 - (void)foreground {
     if(wasRunningBeforeBackground&&!failed) {paused=NO;[sound pause:keyboardActive];[pauseButton setTitle:@"暂停" forState:UIControlStateNormal];}
     [self resetFPS];
+    [self controllersChanged:nil];
 }
 - (void)stop:(NSString *)message {
     failed=YES;[sound pause:YES];[display invalidate];

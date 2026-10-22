@@ -22,6 +22,8 @@ jobs:
           persist-credentials: false
       - name: Audit public tracked sources
         run: python3 tools/audit_public.py
+      - name: Test controller chords and lifecycle
+        run: python3 tools/test_controller.py
       - name: Prepare pinned public dependencies
         run: python3 tools/bootstrap.py
       - name: Install pinned compiler
