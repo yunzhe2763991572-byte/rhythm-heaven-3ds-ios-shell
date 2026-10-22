@@ -1,6 +1,7 @@
 """Compile the production portable input header and test chord/lifecycle behavior."""
 from pathlib import Path
 import argparse
+import os
 import subprocess
 import tempfile
 
@@ -74,13 +75,18 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument("--cc",default="clang")
     args=p.parse_args()
+    # These are host-native tests. The workflow's deployment setting belongs
+    # to the subsequent iOS app build, not to the test executable on the Mac.
+    test_env=dict(os.environ)
+    for name in ("SDKROOT","IPHONEOS_DEPLOYMENT_TARGET","TVOS_DEPLOYMENT_TARGET","WATCHOS_DEPLOYMENT_TARGET","XROS_DEPLOYMENT_TARGET"):
+        test_env.pop(name,None)
     with tempfile.TemporaryDirectory(prefix="rh3ds-controller-") as tmp:
         source=Path(tmp)/"test.c"
         binary=Path(tmp)/"test.exe"
         source.write_text(TEST,encoding="utf-8")
         subprocess.run([args.cc,"-std=c11","-Wall","-Wextra","-Werror","-O2",
-            "-I",str(ROOT/"source/ios-host"),str(source),"-o",str(binary)],check=True)
-        subprocess.run([str(binary)],check=True)
+            "-I",str(ROOT/"source/ios-host"),str(source),"-o",str(binary)],check=True,env=test_env)
+        subprocess.run([str(binary)],check=True,env=test_env)
 
 if __name__=="__main__":
     main()
