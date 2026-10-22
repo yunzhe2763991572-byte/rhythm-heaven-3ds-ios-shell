@@ -1,0 +1,26 @@
+[package]
+name = "rh3ds-mobile"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[workspace]
+
+[dependencies]
+zakuro-core = { path = "../zakuro/crates/zakuro-core" }
+zakuro-common = { path = "../zakuro/crates/zakuro-common" }
+serde_json = "1"
+log = "0.4"
+
+[patch."https://github.com/fearkov/3dsrecomp"]
+recomp-abi = { path = "../3dsrecomp/abi" }
+
+[profile.release]
+opt-level = 2
+debug = 0
+lto = "thin"
+codegen-units = 8
+panic = "unwind"

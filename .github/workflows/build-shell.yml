@@ -1,0 +1,46 @@
+name: Build content-free iOS shell
+on:
+  push:
+    branches: [main]
+    paths: ['source/**', 'tools/**', '.github/workflows/build-shell.yml', 'LICENSE*', 'LICENSES/**']
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: shell-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  shell:
+    runs-on: macos-26-intel
+    timeout-minutes: 30
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+      IPHONEOS_DEPLOYMENT_TARGET: '16.0'
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - name: Audit public tracked sources
+        run: python3 tools/audit_public.py
+      - name: Prepare pinned public dependencies
+        run: python3 tools/bootstrap.py
+      - name: Install pinned compiler
+        run: rustup toolchain install 1.99.1 --profile minimal --target aarch64-apple-ios
+      - name: Verify CPU shader JIT is absent
+        run: |
+          cargo tree --manifest-path source/mobile-bridge/Cargo.toml --target aarch64-apple-ios > output-dependencies.txt
+          if grep -i cranelift output-dependencies.txt; then exit 1; fi
+      - name: Build only the host
+        run: python3 source/ios-host/build_host.py
+      - name: Audit the exact release shell
+        run: python3 tools/audit_shell.py output/RhythmHeaven3DS-shell.ipa --report output/shell-audit.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: RhythmHeaven3DS-content-free-shell
+          path: |
+            output/RhythmHeaven3DS-shell.ipa
+            output/host_manifest.json
+            output/shell-audit.json
+            output-dependencies.txt
+          retention-days: 14
+          if-no-files-found: error

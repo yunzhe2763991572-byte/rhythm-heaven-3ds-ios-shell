@@ -1,0 +1,8 @@
+--- !tapi-tbd-v3
+archs: [ arm64 ]
+platform: ios
+install-name: /usr/lib/libSystem.B.dylib
+exports:
+  - archs: [ arm64 ]
+    symbols: [ _memcpy, _memset, _memmove, _memcmp, _bzero, _sqrt, _sqrtf, _fabs, ___stack_chk_fail, ___stack_chk_guard, dyld_stub_binder ]
+...

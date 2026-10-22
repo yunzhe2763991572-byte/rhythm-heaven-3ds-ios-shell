@@ -1,0 +1,800 @@
+diff --git a/crates/zakuro-core/src/services/apt.rs b/crates/zakuro-core/src/services/apt.rs
+index e437d47..d5a415f 100644
+--- a/crates/zakuro-core/src/services/apt.rs
++++ b/crates/zakuro-core/src/services/apt.rs
+@@ -142,6 +142,10 @@ fn shared_font(system: &mut System) -> Option<(u32, u32)> {
+ 
+ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
+     let command = header.command_id();
++    if std::env::var_os("RH3DS_TRACE_APT").is_some() {
++        log::info!("APT trace command 0x{command:04X}, args {:08X} {:08X}, library {:?}",
++            buffer.get(&mut system.memory,1),buffer.get(&mut system.memory,2),system.services.apt.library_applet);
++    }
+     match command {
+         // GetLockHandle(flags) -> result, applet attributes, power state, lock
+         0x0001 => {
+@@ -234,7 +238,13 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
+         0x0009 => {
+             let applet = buffer.get(&mut system.memory, 1);
+             let apt = &system.services.apt;
+-            let registered = applet != ANY_LIBRARY_APPLET || apt.library_applet.is_some() || apt.keyboard.is_some();
++            let registered = match applet {
++                ANY_LIBRARY_APPLET => apt.library_applet.is_some() || apt.keyboard.is_some(),
++                0x401 | 0x402 | 0x202 => apt.library_applet == Some(applet)
++                    || (applet == super::keyboard::APPLET_ID && apt.keyboard.is_some()),
++                _ => true,
++            };
++            log::info!("apt: IsRegistered(0x{applet:03X}) = {registered}, prepared {:?}",apt.library_applet);
+             buffer.reply(&mut system.memory, 0x0009, &[registered as u32]);
+             true
+         }
+@@ -247,6 +257,7 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
+         0x000C => {
+             let destination = buffer.get(&mut system.memory, 2);
+             let signal = buffer.get(&mut system.memory, 3);
++            log::info!("apt: SendParameter to 0x{destination:03X}, signal {signal}, prepared {:?}",system.services.apt.library_applet);
+             let size = buffer.get(&mut system.memory, 4);
+             let data = read_static(system, buffer, 7, size);
+             if system.services.apt.library_applet == Some(destination) && signal == SIGNAL_REQUEST {
+@@ -536,3 +547,25 @@ fn capture_block(system: &mut System, size: u32) -> Option<ObjectId> {
+     system.services.apt.capture_block = Some((object, size));
+     Some(object)
+ }
++
++#[cfg(test)]
++mod mobile_tests {
++    use super::*;
++    use crate::services::tests::system_with_thread;
++
++    #[test]
++    fn mii_selector_is_not_registered_before_it_is_prepared() {
++        let (mut system, buffer)=system_with_thread();
++        let query=Header::new(0x0009,1,0);
++        buffer.set(&mut system.memory,1,0x402);
++        handle(&mut system,&buffer,query);
++        assert_eq!(buffer.get(&mut system.memory,2),0);
++        system.services.apt.library_applet=Some(0x402);
++        buffer.set(&mut system.memory,1,0x402);
++        handle(&mut system,&buffer,query);
++        assert_eq!(buffer.get(&mut system.memory,2),1);
++        buffer.set(&mut system.memory,1,0x401);
++        handle(&mut system,&buffer,query);
++        assert_eq!(buffer.get(&mut system.memory,2),0);
++    }
++}
+diff --git a/crates/zakuro-core/src/services/dlp.rs b/crates/zakuro-core/src/services/dlp.rs
+index ca87033..5a1d8a8 100644
+--- a/crates/zakuro-core/src/services/dlp.rs
++++ b/crates/zakuro-core/src/services/dlp.rs
+@@ -109,12 +109,19 @@ fn result(description: u32, summary: Summary, level: Level) -> u32 {
+ }
+ 
+ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bool {
++    let command = header.command_id();
++    // IsChild inspects the running process, not the wireless session. Retail
++    // titles call it during startup before initializing Download Play.
++    if command == 0x000E {
++        let child = system.title.as_ref().is_some_and(|title| title.program_id() >> 32 == 0x0004_0001);
++        buffer.reply(&mut system.memory, command, &[child as u32]);
++        return true;
++    }
+     // with no room wireless is off, as local wireless has it, unless the
+     // game already started on it in one
+     if system.services.dlp.state == NOT_INITIALIZED && system.room.as_ref().is_none_or(|room| !room.open()) {
+         return false;
+     }
+-    let command = header.command_id();
+     let word = |system: &mut System, index: u32| buffer.get(&mut system.memory, index);
+     match command {
+         // Initialize(shared memory size, most guests, process, ...) and
+@@ -273,11 +280,6 @@ pub fn handle(system: &mut System, buffer: &CommandBuffer, header: Header) -> bo
+                 None => buffer.reply_error(&mut system.memory, command, result(1007, Summary::NotFound, Level::Status)),
+             }
+         }
+-        // IsChild(process), whether the title running is a Download Play child
+-        0x000E => {
+-            let child = system.title.as_ref().is_some_and(|title| title.program_id() >> 32 == 0x0004_0001);
+-            buffer.reply(&mut system.memory, command, &[child as u32]);
+-        }
+         // GetDupNoticeNeed
+         0x0010 => buffer.reply(&mut system.memory, command, &[0]),
+         _ => return false,
+@@ -536,4 +538,13 @@ mod tests {
+         let (code, _) = request(&mut system, &buffer, &[0x0001_0183, 0x1000, 4, 0, 0, 0, 0, 0, 0, 0]);
+         assert_eq!(code, zakuro_common::result::errors::UDS_WIRELESS_OFF.0);
+     }
++
++    #[test]
++    fn is_child_is_available_without_wireless_or_initialization() {
++        let (mut system, buffer) = system_with_thread();
++        let (code, words) = request(&mut system, &buffer, &[0x000E_0040, 0x22]);
++        assert_eq!(code, 0);
++        assert_eq!(words[0], 0);
++        assert_eq!(system.services.dlp.state, NOT_INITIALIZED);
++    }
+ }
+diff --git a/crates/zakuro-core/src/services/shared_font.rs b/crates/zakuro-core/src/services/shared_font.rs
+index b6f5e27..df86bb8 100644
+--- a/crates/zakuro-core/src/services/shared_font.rs
++++ b/crates/zakuro-core/src/services/shared_font.rs
+@@ -370,7 +370,8 @@ fn rasterize(data: &[u8]) -> Option<Face> {
+ 
+ /// the first font for Japanese the host has, and where it is.
+ fn host_font() -> Option<(std::path::PathBuf, Vec<u8>)> {
+-    font_candidates().into_iter().find_map(|path| Some((path.clone(), std::fs::read(&path).ok()?)))
++    let supplied = std::env::var_os("RH3DS_FONT_PATH").map(std::path::PathBuf::from);
++    supplied.into_iter().chain(font_candidates()).find_map(|path| Some((path.clone(), std::fs::read(&path).ok()?)))
+ }
+ 
+ /// where Windows keeps its fonts for Japanese.
+@@ -391,7 +392,7 @@ fn font_candidates() -> Vec<std::path::PathBuf> {
+ 
+ /// where Linux distributions put Noto's fonts for Japanese, the medium
+ /// weight nearest the console's, or else the font fontconfig picks.
+-#[cfg(all(unix, not(target_os = "macos")))]
++#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+ fn font_candidates() -> Vec<std::path::PathBuf> {
+     let folders = ["/usr/share/fonts/noto-cjk", "/usr/share/fonts/opentype/noto", "/usr/share/fonts/google-noto-cjk", "/usr/share/fonts/noto"];
+     let mut paths: Vec<std::path::PathBuf> = ["NotoSansCJK-Medium.ttc", "NotoSansCJK-Regular.ttc", "NotoSansCJK-Bold.ttc"]
+@@ -407,6 +408,12 @@ fn font_candidates() -> Vec<std::path::PathBuf> {
+     paths
+ }
+ 
++/// An openly licensed font supplied by the mobile frontend, inside its bundle.
++#[cfg(target_os = "ios")]
++fn font_candidates() -> Vec<std::path::PathBuf> {
++    std::env::var_os("RH3DS_FONT_PATH").map(std::path::PathBuf::from).into_iter().collect()
++}
++
+ /// moves a font block's internal pointers to the address the guest has just
+ /// mapped it at, from wherever it was laid out for before, a dump's console
+ /// or an earlier mapping.
+diff --git a/crates/zakuro-gpu/Cargo.toml b/crates/zakuro-gpu/Cargo.toml
+index 2afc90d..f37e775 100644
+--- a/crates/zakuro-gpu/Cargo.toml
++++ b/crates/zakuro-gpu/Cargo.toml
+@@ -5,7 +5,7 @@ edition.workspace = true
+ license.workspace = true
+ 
+ [features]
+-default = ["jit"]
++default = []
+ opengl = ["dep:glow"]
+ vulkan = ["dep:ash", "dep:ash-window", "dep:naga"]
+ # the shaders the CPU runs compiled to the host's code instead of interpreted
+diff --git a/crates/zakuro-gpu/src/lib.rs b/crates/zakuro-gpu/src/lib.rs
+index 943f843..66eaff7 100644
+--- a/crates/zakuro-gpu/src/lib.rs
++++ b/crates/zakuro-gpu/src/lib.rs
+@@ -27,6 +27,11 @@ pub use renderer::{DrawCall, Renderer, RendererKind, SoftwareRenderer};
+ #[cfg(feature = "vulkan")]
+ pub use device::SharedDevice;
+ 
++/// Software-only builds have no host graphics device to share.
++#[cfg(not(feature = "vulkan"))]
++#[derive(Debug)]
++pub struct SharedDevice;
++
+ /// how the GPU reaches guest memory.
+ pub trait GpuMemory {
+     fn read(&mut self, addr: u32, out: &mut [u8]);
+@@ -170,6 +175,10 @@ pub struct Gpu {
+     pub vertices_drawn: u64,
+     /// host time spent running command lists and display transfers.
+     pub busy: std::time::Duration,
++    /// Mobile pacing may omit a visual frame while still executing all
++    /// command/register uploads, transfers, fills and GPU IRQs. Off by default.
++    suppress_draws: bool,
++    pub suppressed_draws: u64,
+     /// decoded textures and the lighting tables, kept across draws.
+     resources: raster::Resources,
+     /// frame interpolation's record of the draws, none while it is off.
+@@ -206,12 +215,24 @@ impl Gpu {
+             transfers: 0,
+             vertices_drawn: 0,
+             busy: std::time::Duration::ZERO,
++            suppress_draws: false,
++            suppressed_draws: 0,
+             resources: raster::Resources::default(),
+             interpolation: None,
+         }
+     }
+ 
+     // -- external registers -------------------------------------------------
++    pub fn suppress_visual_draws(&mut self, suppress: bool) {
++        self.suppress_draws = suppress;
++    }
++
++    pub fn has_hardware_renderer(&self) -> bool {
++        #[cfg(feature = "vulkan")]
++        { self.resources.hardware.is_some() }
++        #[cfg(not(feature = "vulkan"))]
++        { false }
++    }
+ 
+     /// offset is the byte offset GSP uses, where zero means 0x1EB00000.
+     pub fn write_external(&mut self, gsp_offset: u32, value: u32) {
+@@ -622,6 +643,16 @@ impl Gpu {
+ 
+     /// draws the texture pack's pictures in place of the textures they
+     /// replace, or no pack's. only the host's GPU draws them, so a pack
++    #[cfg(not(feature = "vulkan"))]
++    pub fn enable_hardware_renderer(
++        &mut self,
++        _scale: u32,
++        _device: Option<std::sync::Arc<SharedDevice>>,
++        _title: Option<u64>,
++    ) -> Result<String, String> {
++        Err("Hardware rendering is disabled in this software-only build".into())
++    }
++
+     /// waits for enable_hardware_renderer, and says whether it is drawn.
+     pub fn set_texture_pack(&mut self, pack: Option<std::sync::Arc<pack::Pack>>) -> bool {
+         #[cfg(feature = "vulkan")]
+@@ -1049,6 +1080,10 @@ impl Gpu {
+             indexed,
+             registers: &self.internal,
+         });
++        if self.suppress_draws {
++            self.suppressed_draws += 1;
++            return;
++        }
+         self.prepare_shaders();
+         // frame interpolation draws it again in between, where it moved
+         let geometry = self.internal[REG_GEOSTAGE_CONFIG] & 0x3 == 2;
+@@ -1100,6 +1135,10 @@ impl Gpu {
+         let vertices = std::mem::take(&mut self.immediate.vertices);
+         self.draw_calls += 1;
+         self.vertices_drawn += vertices.len() as u64;
++        if self.suppress_draws {
++            self.suppressed_draws += 1;
++            return;
++        }
+         self.prepare_shaders();
+         raster::draw_immediate(
+             &self.internal,
+@@ -1766,6 +1805,29 @@ mod tests {
+         assert_eq!(indexed, [false, true]);
+     }
+ 
++    #[test]
++    fn mobile_suppression_keeps_command_state_and_callbacks() {
++        let list = [command(REG_TEXTURE_CONFIG, 7),command(REG_DRAW_ARRAYS, 1),
++            command(REG_TEXTURE_CONFIG, 3),command(REG_DRAW_ELEMENTS, 1)].concat();
++        let mut memory = FlatMemory(vec![0; 0x200]);
++        for (i, word) in list.iter().enumerate() {
++            memory.0[0x100 + i * 4..][..4].copy_from_slice(&word.to_le_bytes());
++        }
++        let mut regular = Gpu::new();
++        let mut skipped = Gpu::new();skipped.suppress_visual_draws(true);
++        let mut a = Recorder::default();let mut b = Recorder::default();
++        regular.process_command_list(&mut memory.clone(),&mut a,0x100,list.len() as u32 * 4);
++        skipped.process_command_list(&mut memory,&mut b,0x100,list.len() as u32 * 4);
++        assert_eq!(regular.internal,skipped.internal);
++        assert_eq!(regular.draw_calls,skipped.draw_calls);
++        assert_eq!(regular.command_lists,skipped.command_lists);
++        assert_eq!(a.0,b.0);
++        assert_eq!(skipped.suppressed_draws,2);
++        skipped.suppress_visual_draws(false);
++        skipped.process_command_list(&mut memory,&mut b,0x100,list.len() as u32 * 4);
++        assert_eq!(skipped.suppressed_draws,2);
++    }
++
+     /// a command list run as it was before commands went in one go, a
+     /// write_internal for every word, to hold run_command_list against.
+     fn run_word_by_word(gpu: &mut Gpu, memory: &mut FlatMemory, renderer: &mut dyn Renderer, paddr: u32, size: u32) {
+diff --git a/crates/zakuro-gpu/src/raster.rs b/crates/zakuro-gpu/src/raster.rs
+index c673fee..de8bbe3 100644
+--- a/crates/zakuro-gpu/src/raster.rs
++++ b/crates/zakuro-gpu/src/raster.rs
+@@ -954,6 +954,8 @@ pub(crate) enum Pass {
+ /// what draws keep from one to the next.
+ #[derive(Default)]
+ pub struct Resources {
++    profile: [u64; 6],
++    profile_states: std::collections::HashSet<[u32; 24]>,
+     pub textures: TextureCache,
+     pub light_tables: Tables,
+     pub proctex_tables: crate::proctex::Tables,
+@@ -1292,6 +1294,10 @@ impl BoundTexture {
+         let fy = (1.0 - v) * self.height as f32;
+ 
+         if !self.linear {
++            let (x, y) = (fx.floor() as i32, fy.floor() as i32);
++            if x >= 0 && y >= 0 && x < self.width as i32 && y < self.height as i32 {
++                return self.texels[(y as u32 * self.width + x as u32) as usize].map(|c| c as f32 / 255.0);
++            }
+             return self.texel(fx.floor() as i32, fy.floor() as i32);
+         }
+ 
+@@ -1304,10 +1310,16 @@ impl BoundTexture {
+         let ty = fy - y0;
+         let (x0, y0) = (x0 as i32, y0 as i32);
+ 
+-        let a = self.texel(x0, y0);
+-        let b = self.texel(x0 + 1, y0);
+-        let c = self.texel(x0, y0 + 1);
+-        let d = self.texel(x0 + 1, y0 + 1);
++        // Most sprite pixels lie inside the image. Resolve their four
++        // neighbours directly; wrapping/border rules are unchanged outside.
++        let [a, b, c, d] = if x0 >= 0 && y0 >= 0 && x0 < self.width as i32 - 1 && y0 < self.height as i32 - 1 {
++            let index = y0 as usize * self.width as usize + x0 as usize;
++            let row = self.width as usize;
++            [self.texels[index], self.texels[index + 1], self.texels[index + row], self.texels[index + row + 1]]
++                .map(|pixel| pixel.map(|c| c as f32 / 255.0))
++        } else {
++            [self.texel(x0, y0), self.texel(x0 + 1, y0), self.texel(x0, y0 + 1), self.texel(x0 + 1, y0 + 1)]
++        };
+         std::array::from_fn(|i| {
+             let top = a[i] + (b[i] - a[i]) * tx;
+             let bottom = c[i] + (d[i] - c[i]) * tx;
+@@ -1863,15 +1875,19 @@ fn fill_triangle(
+     let writes_color = color_surface.is_some();
+     let partial_write = writes_color && !target.write.iter().all(|&w| w);
+     let any_texture = state.textures.iter().any(Option::is_some) || state.proctex.is_some();
++    let simple_env = state.tex_env.simple();
++    let texture_mask = if state.lighting.is_some() { 0xF } else { state.tex_env.texture_mask() };
++    let edge_steps = edges.map(|edge| -edge.dy * 16);
+     let mut pixel = [0u8; 4];
+ 
+     for y in min_y..max_y {
++        let mut edge_values = edges.map(|edge| edge.at(min_x as i64 * 16 + 8, y as i64 * 16 + 8));
+         for x in min_x..max_x {
+-            // the pixel's center, in sixteenths
+-            let (px, py) = (x as i64 * 16 + 8, y as i64 * 16 + 8);
+-
+-            // barycentric weights via the edge functions.
+-            let values = edges.map(|edge| edge.at(px, py));
++            // Integer edge stepping is bit-identical to evaluating the
++            // equation at each pixel, with three additions instead of six
++            // multiplications. Advance before any rejection/continue.
++            let values = edge_values;
++            edge_values = std::array::from_fn(|i| edge_values[i] + edge_steps[i]);
+             if !edges.iter().zip(values).all(|(edge, value)| edge.covers(value)) {
+                 continue;
+             }
+@@ -1922,6 +1938,7 @@ fn fill_triangle(
+             let mut samples = [[0.0f32, 0.0, 0.0, 1.0]; 4];
+             if any_texture {
+                 for (unit, texture) in state.textures.iter().enumerate() {
++                    if texture_mask & (1 << unit) == 0 { continue; }
+                     let Some(texture) = texture else { continue };
+                     let set = match unit {
+                         2 if state.texture2_uses_coord1 => 1,
+@@ -1931,7 +1948,7 @@ fn fill_triangle(
+                     let v = interpolate([a.texcoords_over_w[set][1], b.texcoords_over_w[set][1], c.texcoords_over_w[set][1]]);
+                     samples[unit] = texture.sample(u, v);
+                 }
+-                if let Some(proctex) = &state.proctex {
++                if let Some(proctex) = state.proctex.as_ref().filter(|_| texture_mask & 8 != 0) {
+                     let set = proctex.coordinates;
+                     let u = interpolate([a.texcoords_over_w[set][0], b.texcoords_over_w[set][0], c.texcoords_over_w[set][0]]);
+                     let v = interpolate([a.texcoords_over_w[set][1], b.texcoords_over_w[set][1], c.texcoords_over_w[set][1]]);
+@@ -1946,7 +1963,10 @@ fn fill_triangle(
+                 let view = std::array::from_fn(|i| interpolate([a.view_over_w[i], b.view_over_w[i], c.view_over_w[i]]));
+                 lighting.shade(state.tables, quaternion, view, &samples)
+             });
+-            let combined = state.tex_env.apply(color, samples, fragment);
++            let combined = match &simple_env {
++                Some(env) => env.apply(color, samples, fragment),
++                None => state.tex_env.apply(color, samples, fragment),
++            };
+             let mut rgba = combined.map(|c| (c * 255.0) as u8);
+ 
+             if let Some(test) = state.alpha_test {
+@@ -2372,6 +2392,9 @@ fn assemble(topology: u32, count: usize) -> Vec<(usize, usize, usize)> {
+ /// the triangles drawn, none for arrays the GPU could not decode, which the
+ /// CPU decodes then.
+ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Resources, vertices: Vertices) -> Option<u32> {
++    static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let profile = *PROFILE.get_or_init(|| std::env::var_os("RH3DS_PROFILE_RASTER").is_some());
++    let clock = profile.then(std::time::Instant::now);
+     let vertex_count = vertices.len();
+     // the offset is two signed 10-bit fields.
+     let signed10 = |value: u32| (((value & 0x3FF) << 22) as i32 >> 22) as f32;
+@@ -2526,6 +2549,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
+             }
+         }
+     }
++    let setup_time = clock.map(|start| start.elapsed());
+     let processed;
+     let (shaded, order) = match vertices {
+         Vertices::Shaded(shaded) => (shaded, None),
+@@ -2537,6 +2561,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
+         #[cfg(feature = "vulkan")]
+         Vertices::Raw { .. } => return None,
+     };
++    let shader_time = clock.map(|start| start.elapsed());
+     // which of the vertices made each vertex of the draw is
+     let at = |i: usize| order.map_or(i, |order| order[i]);
+     let triangle_indices = assemble(topology, order.map_or(shaded.len(), <[usize]>::len));
+@@ -2626,6 +2651,7 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
+         }
+     }
+ 
++    let geometry_time = clock.map(|start| start.elapsed());
+     let triangles: Vec<[Screen; 3]> =
+         indices.as_chunks::<3>().0.iter().map(|&[a, b, c]| [placed[a as usize], placed[b as usize], placed[c as usize]]).collect();
+     // the rows the triangles can reach, as window rows and then as rows of
+@@ -2685,6 +2711,26 @@ fn rasterize<M: GpuMemory>(registers: &[u32], memory: &mut M, resources: &mut Re
+         );
+     }
+ 
++    if let Some(start) = clock {
++        let pattern = [0xC0,0xC8,0xD0,0xD8,0xF0,0xF8].map(|base| [registers[base],registers[base+1],registers[base+2],registers[base+4]]).as_flattened().try_into().unwrap();
++        if resources.profile_states.len() < 64 && resources.profile_states.insert(pattern) {
++            log::info!("raster combiner: simple {} states {:08X?}",state.tex_env.simple().is_some(),pattern);
++        }
++        let setup = setup_time.unwrap();
++        let shader = shader_time.unwrap();
++        let geometry = geometry_time.unwrap();
++        resources.profile[0] += 1;
++        resources.profile[1] += setup.as_nanos() as u64;
++        resources.profile[2] += (shader - setup).as_nanos() as u64;
++        resources.profile[3] += (geometry - shader).as_nanos() as u64;
++        resources.profile[4] += (start.elapsed() - geometry).as_nanos() as u64;
++        resources.profile[5] += stats.written as u64;
++        if resources.profile[0] % 4096 == 0 {
++            log::info!("raster profile: draws {} setup {:.3}s shader {:.3}s geometry {:.3}s fill {:.3}s pixels {}",
++                resources.profile[0],resources.profile[1] as f64 / 1e9,resources.profile[2] as f64 / 1e9,
++                resources.profile[3] as f64 / 1e9,resources.profile[4] as f64 / 1e9,resources.profile[5]);
++        }
++    }
+     Some(stats.written)
+ }
+ 
+@@ -2693,6 +2739,53 @@ mod tests {
+     use super::*;
+     use std::collections::HashMap;
+ 
++    #[test]
++    fn mobile_interior_sampler_preserves_wrap_and_filter_bits() {
++        let mut seed = 0x9155_2997u32;
++        let mut next = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); seed };
++        for width in [1u32, 2, 7, 16] {
++            let height = width + 1;
++            let texels: Arc<[[u8; 4]]> = (0..width * height).map(|_| next().to_le_bytes()).collect();
++            for wrap_s in [Wrap::Repeat, Wrap::MirroredRepeat, Wrap::ClampToEdge, Wrap::ClampToBorder] {
++                for wrap_t in [Wrap::Repeat, Wrap::MirroredRepeat, Wrap::ClampToEdge, Wrap::ClampToBorder] {
++                    for linear in [false, true] {
++                        let texture = BoundTexture { texels: texels.clone(), drawn: None, replacement: None, width, height, wrap_s, wrap_t, linear, border: [0.1, 0.2, 0.3, 0.4] };
++                        for _ in 0..500 {
++                            let u = (next() % 4000) as f32 / 1000.0 - 1.0;
++                            let v = (next() % 4000) as f32 / 1000.0 - 1.0;
++                            let fx = u * width as f32;
++                            let fy = (1.0 - v) * height as f32;
++                            let expected = if !linear {
++                                texture.texel(fx.floor() as i32, fy.floor() as i32)
++                            } else {
++                                let (fx, fy) = (fx - 0.5, fy - 0.5);
++                                let (x, y) = (fx.floor(), fy.floor());
++                                let (tx, ty) = (fx - x, fy - y);
++                                let (x, y) = (x as i32, y as i32);
++                                let [a, b, c, d] = [texture.texel(x, y), texture.texel(x + 1, y), texture.texel(x, y + 1), texture.texel(x + 1, y + 1)];
++                                std::array::from_fn(|i| { let top = a[i] + (b[i] - a[i]) * tx; let bottom = c[i] + (d[i] - c[i]) * tx; top + (bottom - top) * ty })
++                            };
++                            assert_eq!(texture.sample(u, v).map(f32::to_bits), expected.map(f32::to_bits));
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn mobile_integer_edge_steps_equal_equation() {
++        for edge in [Edge { x: -31, y: 52, dx: 711, dy: -989, owns_ties: true }, Edge { x: 6400, y: 3840, dx: -6400, dy: 0, owns_ties: false }] {
++            for y in -10..260 {
++                let mut value = edge.at(-8 * 16 + 8, y * 16 + 8);
++                for x in -8..420 {
++                    assert_eq!(value, edge.at(x * 16 + 8, y * 16 + 8));
++                    value -= edge.dy * 16;
++                }
++            }
++        }
++    }
++
+     /// the varyings picked out of packed attributes one by one, the way
+     /// they were before VertexPlan.
+     fn picked_vertex(map: &OutputMap, attributes: &[Vec4; 16]) -> Vertex {
+diff --git a/crates/zakuro-gpu/src/raster/hardware.rs b/crates/zakuro-gpu/src/raster/hardware.rs
+index a02db68..e710a9e 100644
+--- a/crates/zakuro-gpu/src/raster/hardware.rs
++++ b/crates/zakuro-gpu/src/raster/hardware.rs
+@@ -52,7 +52,12 @@ const UPRIGHT_SPIRV: &[u8] = include_bytes!("../../shaders/upright.comp.spv");
+ const UPRIGHT_IMAGE_SPIRV: &[u8] = include_bytes!("../../shaders/upright_image.comp.spv");
+ 
+ const COLOR_FORMAT: vk::Format = vk::Format::R8G8B8A8_UNORM;
++#[cfg(not(target_os = "ios"))]
+ const DEPTH_FORMAT: vk::Format = vk::Format::D24_UNORM_S8_UINT;
++// Apple GPUs provide native float depth/stencil; guest D24 samples are
++// still unpacked/repacked by the existing normalized depth transfer path.
++#[cfg(target_os = "ios")]
++const DEPTH_FORMAT: vk::Format = vk::Format::D32_SFLOAT_S8_UINT;
+ 
+ /// where a batch keeps its vertices, uniforms and uploads.
+ const RING_SIZE: u64 = 64 << 20;
+@@ -549,9 +554,11 @@ pub(crate) fn pipeline_cache(title: u64) -> Option<std::path::PathBuf> {
+         return None;
+     }
+     let var = |name: &str| std::env::var_os(name).filter(|value| !value.is_empty()).map(std::path::PathBuf::from);
+-    let dir = if cfg!(windows) {
++    let dir = if let Some(dir)=var("RH3DS_CACHE_DIRECTORY") {
++        Some(dir)
++    } else if cfg!(windows) {
+         var("LOCALAPPDATA")
+-    } else if cfg!(target_os = "macos") {
++    } else if cfg!(any(target_os = "macos",target_os = "ios")) {
+         var("HOME").map(|home| home.join("Library/Caches"))
+     } else {
+         var("XDG_CACHE_HOME").or_else(|| var("HOME").map(|home| home.join(".cache")))
+@@ -5336,10 +5343,24 @@ fn renders_on(instance: &ash::Instance, device: vk::PhysicalDevice) -> bool {
+         )
+     };
+     let push = extensions.iter().any(|e| e.extension_name_as_c_str() == Ok(ash::khr::push_descriptor::NAME));
++    #[cfg(target_os = "ios")]
++    log::info!("iOS Vulkan device {:?}, API {}.{}, depth clamp {}, native depth/stencil 0x{:X}, push descriptors {}",
++        properties.device_name_as_c_str(),vk::api_version_major(properties.api_version),vk::api_version_minor(properties.api_version),
++        features.depth_clamp,depth.optimal_tiling_features.as_raw(),push);
++    let mut features13 = vk::PhysicalDeviceVulkan13Features::default();
++    let mut features2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut features13);
++    // SAFETY: query supported features with a live output chain.
++    unsafe { instance.get_physical_device_features2(device, &mut features2) };
++    #[cfg(target_os = "ios")]
++    log::info!("iOS Vulkan features: dynamic rendering {}, synchronization2 {}, pipeline cache control {}",
++        features13.dynamic_rendering, features13.synchronization2, features13.pipeline_creation_cache_control);
+     properties.api_version >= vk::API_VERSION_1_3
+         && features.depth_clamp == vk::TRUE
+         && depth.optimal_tiling_features.contains(vk::FormatFeatureFlags::DEPTH_STENCIL_ATTACHMENT)
+         && push
++        && features13.dynamic_rendering == vk::TRUE
++        && features13.synchronization2 == vk::TRUE
++        && features13.pipeline_creation_cache_control == vk::TRUE
+ }
+ 
+ /// whether the renderer can draw on a GPU through a family of its queues,
+@@ -5365,6 +5386,13 @@ pub(crate) fn render_device(
+     let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities)];
+     let mut extensions = vec![ash::khr::push_descriptor::NAME.as_ptr()];
+     extensions.extend_from_slice(extra);
++    #[cfg(target_os = "ios")]
++    {
++        let available = unsafe { instance.enumerate_device_extension_properties(physical) }.unwrap_or_default();
++        if available.iter().any(|e| e.extension_name_as_c_str() == Ok(c"VK_KHR_portability_subset")) {
++            extensions.push(c"VK_KHR_portability_subset".as_ptr());
++        }
++    }
+     // SAFETY: the physical device came from this instance
+     let supported = unsafe { instance.get_physical_device_features(physical) };
+     let logic_ops = supported.logic_op == vk::TRUE;
+@@ -5447,14 +5475,36 @@ fn dynamic_state(instance: &ash::Instance, physical: vk::PhysicalDevice, logic_o
+     Dynamic { blend, logic_op }
+ }
+ 
++/// Direct MoltenVK entry points need no loader portability extension. Enable
++/// portability enumeration only when the entry actually advertises it; the
++/// instance flag is valid only together with that enabled extension.
++fn portability_instance_options(available: &[vk::ExtensionProperties]) -> (Vec<*const std::ffi::c_char>, vk::InstanceCreateFlags) {
++    if available.iter().any(|e| e.extension_name_as_c_str() == Ok(ash::khr::portability_enumeration::NAME)) {
++        (vec![ash::khr::portability_enumeration::NAME.as_ptr()], vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR)
++    } else {
++        (Vec::new(), vk::InstanceCreateFlags::empty())
++    }
++}
++
+ /// a device of the renderer's own, on the GPU pick chooses.
+ pub(crate) fn own_device() -> Result<SharedDevice, String> {
+     // SAFETY: loads the system's Vulkan library, which has no other
+     // requirements
+-    let entry = unsafe { ash::Entry::load() }.map_err(|e| format!("no Vulkan loader, {e}"))?;
++    let entry = unsafe {
++        match std::env::var_os("RH3DS_VULKAN_LIBRARY") {
++            Some(path) => ash::Entry::load_from(path),
++            None => ash::Entry::load(),
++        }
++    }.map_err(|e| format!("no Vulkan loader, {e}"))?;
+     let app = vk::ApplicationInfo::default().application_name(c"zakuro").api_version(vk::API_VERSION_1_3);
+-    // SAFETY: a plain instance with no layers or extensions
+-    let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }
++    // SAFETY: enumerates extensions from the live loaded driver/loader.
++    let available = unsafe { entry.enumerate_instance_extension_properties(None) }
++        .map_err(vk_error("list instance extensions"))?;
++    let (names, flags) = portability_instance_options(&available);
++    log::info!("Vulkan instance: {} advertised extensions, portability enumeration {}", available.len(), !names.is_empty());
++    let info = vk::InstanceCreateInfo::default().application_info(&app)
++        .enabled_extension_names(&names).flags(flags);
++    let instance = unsafe { entry.create_instance(&info, None) }
+         .map_err(vk_error("create an instance"))?;
+     let made = pick(&instance).and_then(|(physical, family)| render_device(&entry, &instance, physical, family, &[]));
+     if made.is_err() {
+@@ -5474,7 +5524,8 @@ fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
+         // SAFETY: as above
+         let (properties, families) =
+             unsafe { (instance.get_physical_device_properties(device), instance.get_physical_device_queue_family_properties(device)) };
+-        let Some(family) = families.iter().position(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS)) else { continue };
++        let both = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
++        let Some(family) = families.iter().position(|f| f.queue_flags.contains(both)) else { continue };
+         if !renders_on(instance, device) {
+             continue;
+         }
+@@ -5487,14 +5538,44 @@ fn pick(instance: &ash::Instance) -> Result<(vk::PhysicalDevice, u32), String> {
+             best = Some((rank, device, family as u32));
+         }
+     }
+-    best.map(|(_, device, family)| (device, family))
+-        .ok_or_else(|| "no GPU with Vulkan 1.3, push descriptors and a D24S8 depth format".to_owned())
++    best.map(|(_, device, family)| {
++        let properties = unsafe { instance.get_physical_device_properties(device) };
++        log::info!("Selected Vulkan GPU {:?}, graphics/compute queue {}, depth format {}",
++            properties.device_name_as_c_str(), family, DEPTH_FORMAT.as_raw());
++        (device, family)
++    }).ok_or_else(|| "no GPU with Vulkan 1.3 rendering/sync/cache features, push descriptors, depth clamp and native depth/stencil".to_owned())
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn direct_driver_without_portability_extension_uses_no_extension_or_flag() {
++        let mut metal_surface = vk::ExtensionProperties::default();
++        for (dst, src) in metal_surface.extension_name.iter_mut().zip(c"VK_EXT_metal_surface".to_bytes_with_nul()) {
++            *dst = *src as std::ffi::c_char;
++        }
++        for available in [&[][..], &[metal_surface][..]] {
++            let (names, flags) = portability_instance_options(available);
++            assert!(names.is_empty());
++            assert_eq!(flags.as_raw(), 0);
++        }
++    }
++
++    #[test]
++    fn loader_portability_extension_and_flag_are_enabled_together() {
++        let mut portability = vk::ExtensionProperties::default();
++        for (dst, src) in portability.extension_name.iter_mut().zip(ash::khr::portability_enumeration::NAME.to_bytes_with_nul()) {
++            *dst = *src as std::ffi::c_char;
++        }
++        let (names, flags) = portability_instance_options(&[portability]);
++        assert_eq!(names.len(), 1);
++        // The returned name is static; compare its value, not constant-pool addresses.
++        assert_eq!(unsafe { std::ffi::CStr::from_ptr(names[0]) }, ash::khr::portability_enumeration::NAME);
++        assert_eq!(flags.as_raw(), vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR.as_raw());
++    }
++
+     /// a block gathered with the words of the last one staged is read from
+     /// where that went, any other is staged anew, and nothing is read from
+     /// a batch handed over.
+diff --git a/crates/zakuro-gpu/src/tev.rs b/crates/zakuro-gpu/src/tev.rs
+index 1234903..4838f5c 100644
+--- a/crates/zakuro-gpu/src/tev.rs
++++ b/crates/zakuro-gpu/src/tev.rs
+@@ -110,6 +110,37 @@ pub struct TexEnv {
+     buffer_color: [f32; 4],
+ }
+ 
++/// A single active stage with unmodified RGBA sources. Prepared once per
++/// triangle, instead of dispatching six general combiner stages per pixel.
++pub(crate) struct SimpleEnv {
++    operation: Operation,
++    sources: [Source; 2],
++    constant: [f32; 4],
++}
++
++impl SimpleEnv {
++    #[inline]
++    pub(crate) fn apply(&self, primary: [f32; 4], textures: [[f32; 4]; 4], fragment: Option<([f32; 4], [f32; 4])>) -> [f32; 4] {
++        let pick = |source| match source {
++            Source::PrimaryColor | Source::Previous => primary,
++            Source::PrimaryFragmentColor => fragment.map_or(primary, |(diffuse, _)| diffuse),
++            Source::SecondaryFragmentColor => fragment.map_or([0.0, 0.0, 0.0, 1.0], |(_, specular)| specular),
++            Source::Texture(unit) => textures[unit],
++            Source::Constant => self.constant,
++            Source::PreviousBuffer => unreachable!("buffer stages are not specialized"),
++        };
++        let left = pick(self.sources[0]);
++        match self.operation {
++            Operation::Replace => left.map(|v| v.clamp(0.0, 1.0)),
++            Operation::Modulate => {
++                let right = pick(self.sources[1]);
++                std::array::from_fn(|i| (left[i] * right[i]).clamp(0.0, 1.0))
++            }
++            _ => unreachable!("only replace and modulate are specialized"),
++        }
++    }
++}
++
+ impl Stage {
+     /// replace, taking the previous stage's color and alpha as they are,
+     /// at a scale of one, a stage that changes nothing.
+@@ -126,6 +157,39 @@ impl Stage {
+ }
+ 
+ impl TexEnv {
++    pub(crate) fn simple(&self) -> Option<SimpleEnv> {
++        // The first active stage can be preceded only by passthroughs.
++        // Buffer reads depend on stage position and stay on the general path.
++        let mut active = self.stages.iter().zip(self.passthrough).filter(|(_, pass)| !pass).map(|(stage, _)| stage);
++        let stage = active.next()?;
++        if active.next().is_some() { return None; }
++        if stage.color_op != stage.alpha_op || !matches!(stage.color_op, Operation::Replace | Operation::Modulate)
++            || stage.color_scale != 1.0 || stage.alpha_scale != 1.0 { return None; }
++        let count = stage.color_op.inputs();
++        for i in 0..count {
++            if stage.color_sources[i] != stage.alpha_sources[i] || stage.color_operands[i] != 0
++                || stage.alpha_operands[i] != 0 || stage.color_sources[i] == Source::PreviousBuffer { return None; }
++        }
++        Some(SimpleEnv { operation: stage.color_op, sources: [stage.color_sources[0], stage.color_sources[1]], constant: stage.constant })
++    }
++
++    /// Conservative mask: includes every texture read by any active stage,
++    /// even if a later stage overwrites that value.
++    pub(crate) fn texture_mask(&self) -> u8 {
++        let mut mask = 0;
++        for (stage, pass) in self.stages.iter().zip(self.passthrough) {
++            if pass { continue; }
++            for source in &stage.color_sources[..stage.color_op.inputs()] {
++                if let Source::Texture(unit) = source { mask |= 1 << unit; }
++            }
++            if stage.color_op != Operation::Dot3Rgba {
++                for source in &stage.alpha_sources[..stage.alpha_op.inputs()] {
++                    if let Source::Texture(unit) = source { mask |= 1 << unit; }
++                }
++            }
++        }
++        mask
++    }
+     pub fn read(registers: &[u32]) -> TexEnv {
+         TexEnv::decode(&TexEnv::registers_read(registers))
+     }
+@@ -378,6 +442,51 @@ fn combine_alpha(op: Operation, v: [f32; 3]) -> f32 {
+ mod tests {
+     use super::*;
+ 
++    #[test]
++    fn mobile_simple_combiner_matches_general_bits() {
++        let mut seed = 0x8753_3191u32;
++        let mut next = || { seed = seed.wrapping_mul(1664525).wrapping_add(1013904223); seed };
++        for position in 0..6 {
++            for operation in [0u32, 1] {
++                for left in [0u32, 1, 2, 3, 4, 5, 6, 14, 15] {
++                    for right in [0u32, 1, 2, 3, 4, 5, 6, 14, 15] {
++                        let mut registers = passthrough_registers();
++                        let base = STAGE_REGISTERS[position];
++                        let sources = left | (right << 4);
++                        registers[base] = sources | sources << 16;
++                        registers[base + 2] = operation | operation << 16;
++                        registers[base + 3] = next();
++                        registers[REG_UPDATE_BUFFER] = next();
++                        let env = TexEnv::read(&registers);
++                        let Some(simple) = env.simple() else { continue };
++                        for _ in 0..8 {
++                            let mut color = || std::array::from_fn(|_| (next() % 1024) as f32 / 512.0 - 0.5);
++                            let primary = color();
++                            let textures = std::array::from_fn(|_| color());
++                            let fragment = Some((color(), color()));
++                            for fragment in [None, fragment] {
++                                assert_eq!(simple.apply(primary, textures, fragment).map(f32::to_bits),
++                                    env.apply(primary, textures, fragment).map(f32::to_bits));
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
++
++    #[test]
++    fn mobile_texture_mask_respects_operation_and_alpha_sources() {
++        let mut registers = passthrough_registers();
++        let base = STAGE_REGISTERS[0];
++        registers[base] = 0x0005_0043; // RGB reads texture 0, alpha reads texture 2.
++        assert_eq!(TexEnv::read(&registers).texture_mask(), 0b0101);
++        registers[base + 2] = 1; // RGB now also reads texture 1.
++        assert_eq!(TexEnv::read(&registers).texture_mask(), 0b0111);
++        registers[base + 2] = 7; // Dot3RGBA ignores alpha configuration.
++        assert_eq!(TexEnv::read(&registers).texture_mask(), 0b0011);
++    }
++
+     /// registers holding a single stage that just modulates texture 0 with
+     /// the vertex color, the configuration the power-on default describes
+     /// and what the rasterizer used to assume unconditionally.
